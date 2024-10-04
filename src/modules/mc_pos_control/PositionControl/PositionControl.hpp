@@ -1,4 +1,4 @@
-/****************************************************************************
+/*******************************************************************
  *
  *   Copyright (c) 2018 - 2019 PX4 Development Team. All rights reserved.
  *
@@ -29,7 +29,7 @@
  * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  *
- ****************************************************************************/
+ *******************************************************************/
 
 /**
  * @file PositionControl.hpp
@@ -161,7 +161,9 @@ public:
 	 * Set the integral term in xy to 0.
 	 * @see _vel_int
 	 */
-	void resetIntegral() { _vel_int.setZero(); }
+	void resetIntegral() { 
+		_vel_int.setZero(); 
+		_pos_int.setZero(); }
 
 	/**
 	 * Get the controllers output local position setpoint
@@ -194,6 +196,7 @@ private:
 	void _positionControl(); ///< Position proportional control
 	void _velocityControl(const float dt); ///< Velocity PID control
 	void _accelerationControl(); ///< Acceleration setpoint processing
+	void _slidingModeControl(const float dt); ///< Sliding mode control
 
 	// Gains
 	matrix::Vector3f _gain_pos_p; ///< Position control proportional gain
@@ -217,6 +220,7 @@ private:
 	matrix::Vector3f _vel; /**< current velocity */
 	matrix::Vector3f _vel_dot; /**< velocity derivative (replacement for acceleration estimate) */
 	matrix::Vector3f _vel_int; /**< integral term of the velocity controller */
+	matrix::Vector3f _pos_int; /**< integral term of the position controller */
 	float _yaw{}; /**< current heading */
 
 	// Setpoints
@@ -226,4 +230,10 @@ private:
 	matrix::Vector3f _thr_sp; /**< desired thrust */
 	float _yaw_sp{}; /**< desired heading */
 	float _yawspeed_sp{}; /** desired yaw-speed */
+
+	// Controller only
+	float sat_sxin{};
+	float sat_syin{};
+	float sat_szin{};
+
 };

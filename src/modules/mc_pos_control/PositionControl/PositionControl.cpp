@@ -1,4 +1,4 @@
-/****************************************************************************
+/*******************************************************************
  *
  *   Copyright (c) 2018 - 2019 PX4 Development Team. All rights reserved.
  *
@@ -29,7 +29,7 @@
  * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  *
- ****************************************************************************/
+ ******************************************************************/
 
 /**
  * @file PositionControl.cpp
@@ -38,11 +38,14 @@
 #include "PositionControl.hpp"
 #include "ControlMath.hpp"
 #include <float.h>
+//#include <chrono>
 #include <mathlib/mathlib.h>
 #include <px4_platform_common/defines.h>
 #include <geo/geo.h>
 
 using namespace matrix;
+
+#define SMC_CONTROLLER_START true
 
 const trajectory_setpoint_s PositionControl::empty_trajectory_setpoint = {0, {NAN, NAN, NAN}, {NAN, NAN, NAN}, {NAN, NAN, NAN}, {NAN, NAN, NAN}, NAN, NAN};
 
@@ -110,8 +113,13 @@ bool PositionControl::update(const float dt)
 	bool valid = _inputValid();
 
 	if (valid) {
+		if (SMC_CONTROLLER_START)
+			_slidingModeControl(dt); 
+
+		else {
 		_positionControl();
 		_velocityControl(dt);
+		}
 
 		_yawspeed_sp = PX4_ISFINITE(_yawspeed_sp) ? _yawspeed_sp : 0.f;
 		_yaw_sp = PX4_ISFINITE(_yaw_sp) ? _yaw_sp : _yaw; // TODO: better way to disable yaw control
@@ -120,6 +128,110 @@ bool PositionControl::update(const float dt)
 	// There has to be a valid output acceleration and thrust setpoint otherwise something went wrong
 	return valid && _acc_sp.isAllFinite() && _thr_sp.isAllFinite();
 }
+
+void PositionControl::_slidingModeControl(const float dt)
+{
+	// P-position controller -----------------------------------------------------------------------------------
+	// Gain values for position control
+	Vector3f lam_p = Vector3f(1, 1, 1);
+	Vector3f k_p = Vector3f(0.95, 0.95, 1);
+	
+	// Epsilon for saturation
+	float eps_p = 1.0;
+
+	// Calculate postion error
+	Vector3f pos_error = _pos_sp - _pos;
+
+	// Compute sliding surface
+	Vector3f s_p = lam_p.emult(pos_error);
+	
+	// Calculate position switching control
+	Vector3f Ud_p = Vector3f(ControlMath::sat(s_p(0)/eps_p) * k_p(0), ControlMath::sat(s_p(1)/eps_p) * k_p(1), ControlMath::sat(s_p(2)/eps_p) * k_p(2));
+
+	// Calculate velocity setpoint
+	Vector3f vel_sp_position = Ud_p;
+	
+	// Position and feed-forward velocity setpoints or position states being NAN results in them not having an influence
+	ControlMath::addIfNotNanVector3f(_vel_sp, vel_sp_position);
+
+	// make sure there are no NAN elements for further reference while constraining
+	ControlMath::setZeroIfNanVector3f(vel_sp_position);
+
+	// Constrain horizontal velocity by prioritizing the velocity component along the
+	// the desired position setpoint over the feed-forward term.
+	_vel_sp.xy() = ControlMath::constrainXY(vel_sp_position.xy(), (_vel_sp - vel_sp_position).xy(), _lim_vel_horizontal);
+	
+	// Constrain velocity in z-direction.
+	_vel_sp(2) = math::constrain(_vel_sp(2), -_lim_vel_up, _lim_vel_down);
+	
+	// Gain values for velocity control ------------------------------------------
+	Vector3f lam = Vector3f(1.8, 1.8, 4.0);
+	Vector3f k = Vector3f(1.9, 1.9, 2.2);
+
+	// Epsilon for saturation
+	Vector3f eps = Vector3f(10.7, 10.7, 15.7);
+	
+	// Calculate velocity error
+	Vector3f vel_error = _vel_sp - _vel;
+
+	// Constrain vertical velocity integral
+	_vel_int(2) = math::constrain(_vel_int(2), -CONSTANTS_ONE_G, CONSTANTS_ONE_G);
+
+	// Compute sliding surface
+	Vector3f s = lam.emult(_vel_int) - _vel;
+
+	// Compute switching control
+	Vector3f Ud = Vector3f(ControlMath::sat(s(0)/eps(0)) * k(0), ControlMath::sat(s(1)/eps(1)) * k(1), ControlMath::sat(s(2)/eps(2)) * k(2));
+
+	// Compute acceleration setpoint
+	Vector3f acc_sp_velocity = lam.emult(vel_error) + Ud;
+	
+	// Add acceleration setpoint if not NaN
+	ControlMath::addIfNotNanVector3f(_acc_sp, acc_sp_velocity);
+	
+ 
+    // Perform acceleration control --------------------------------------------
+    _thr_sp(2) = math::max(_thr_sp(2), -_lim_thr_max);
+
+    // Get allowed horizontal thrust after prioritizing vertical control
+    const float thrust_max_squared = _lim_thr_max * _lim_thr_max;
+    const float thrust_z_squared = _thr_sp(2) * _thr_sp(2);
+    const float thrust_max_xy_squared = thrust_max_squared - thrust_z_squared;
+    float thrust_max_xy = 0;
+
+    if (thrust_max_xy_squared > 0) {
+        thrust_max_xy = sqrtf(thrust_max_xy_squared);
+    }
+
+    // Saturate thrust in horizontal direction
+    const Vector2f thrust_sp_xy(_thr_sp);
+    const float thrust_sp_xy_norm = thrust_sp_xy.norm();
+
+    if (thrust_sp_xy_norm > thrust_max_xy) {
+        _thr_sp.xy() = thrust_sp_xy / thrust_sp_xy_norm * thrust_max_xy;
+    }
+
+	// Use tracking Anti-Windup for horizontal direction: during saturation, the integrator is used to unsaturate the output
+	// see Anti-Reset Windup for PID controllers, L.Rundqwist, 1990
+	const Vector2f acc_sp_xy_produced = Vector2f(_thr_sp) * (CONSTANTS_ONE_G / _hover_thrust);
+	const float arw_gain = 2.f / _gain_vel_p(0);
+
+	// The produced acceleration can be greater or smaller than the desired acceleration due to the saturations and the actual vertical thrust (computed independently).
+	// The ARW loop needs to run if the signal is saturated only.
+	const Vector2f acc_sp_xy = _acc_sp.xy();
+	const Vector2f acc_limited_xy = (acc_sp_xy.norm_squared() > acc_sp_xy_produced.norm_squared())
+					? acc_sp_xy_produced
+					: acc_sp_xy;
+	vel_error.xy() = Vector2f(vel_error) - arw_gain * (acc_sp_xy - acc_limited_xy);
+
+	// Make sure integral doesn't get NAN
+	ControlMath::setZeroIfNanVector3f(vel_error);
+
+	// Update integral part of velocity control
+	_vel_int += vel_error * dt;
+
+}
+
 
 void PositionControl::_positionControl()
 {

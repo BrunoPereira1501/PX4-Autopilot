@@ -92,6 +92,7 @@ if(gz-transport_FOUND)
 		default
 		windy
 		baylands
+		aruco
 	)
 
 	# find corresponding airframes
